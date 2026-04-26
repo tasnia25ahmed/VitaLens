@@ -257,15 +257,14 @@ export async function getPatientVitalsHistory(patientId) {
  */
 export async function writeConcernLog({ patientId, score, narrative, trajectory }) {
   const sql = `
-    INSERT INTO CONCERN_LOG (
-      patient_id, 
-      generated_at, 
-      concern_score, 
-      narrative_text,
-      trajectory_json
-    ) VALUES (?, CURRENT_TIMESTAMP(), ?, ?, ?)
+ INSERT INTO CONCERN_LOG (
+      PATIENT_ID, 
+      GENERATED_AT, 
+      CONCERN_SCORE, 
+      NARRATIVE_TEXT,
+      TRAJECTORY_JSON
+    ) VALUES (?, CURRENT_TIMESTAMP(), ?, ?, PARSE_JSON(?))
   `;
-  
   const trajectoryJson = trajectory ? JSON.stringify(trajectory) : null;
   return await query(sql, [patientId, score, narrative, trajectoryJson]);
 }
