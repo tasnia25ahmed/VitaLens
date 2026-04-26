@@ -124,11 +124,11 @@ npm run start
 
 Thank you for checking out **VitaLens**! 🎉
 
-The night shift deserves better tools — ones that are timely, calm, and genuinely useful when it matters most. If this resonates with you, give us a ⭐ on GitHub.
+The night shift deserves better tools, ones that are timely, calm, and genuinely useful when it matters most. If this resonates with you, give us a ⭐ on GitHub.
 
 
 
-> ⚠️ VitaLens is a prototype built for demonstration purposes. It is not a certified medical device and should not be used for real clinical decision-making.
+> ⚠️ VitaLens is a prototype built for demonstration purposes. It is not a certified medical device and should not be used for real clinical decision making.
 
 ---
 
