@@ -252,6 +252,18 @@ export async function getPatientVitalsHistory(patientId) {
   return await query(sql, [patientId]);
 }
 
+// Update Table 3 in bootstrapSchema()
+await query(`
+  CREATE TABLE IF NOT EXISTS CONCERN_LOG (
+    log_id          VARCHAR DEFAULT UUID_STRING() PRIMARY KEY,
+    patient_id      VARCHAR REFERENCES PATIENTS(patient_id),
+    generated_at    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    concern_score   FLOAT,
+    narrative_text  VARCHAR,
+    audio_data      TEXT, -- Add this to store the Base64 string
+    trajectory_json VARIANT
+  )
+`);
 /**
  * Writes the AI-generated clinical narrative and concern score to the audit log.
  */

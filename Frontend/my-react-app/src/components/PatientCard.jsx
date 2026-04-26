@@ -11,6 +11,32 @@ const v = {
   bp: patient.AVG_BP || patient.bpbl,
 };
 
+import { useEffect, useRef } from 'react'; // Add useRef
+
+// Inside your PatientCard component:
+const hasPlayedRef = useRef(false);
+
+useEffect(() => {
+  // If the score drops below 60, reset the 'played' flag 
+  // so it can trigger again if they crash a second time.
+  if (score < 60) {
+    hasPlayedRef.current = false;
+    return;
+  }
+
+  // Trigger audio ONLY if it's Critical, there is audio data, 
+  // and we haven't played it for this specific "event" yet.
+  if (score >= 60 && patient.audio_data && !hasPlayedRef.current) {
+    const audio = new Audio(`data:audio/mpeg;base64,${patient.audio_data}`);
+    
+    audio.play()
+      .then(() => {
+        hasPlayedRef.current = true; // Mark as played
+      })
+      .catch(e => console.error("Playback failed:", e));
+  }
+}, [score, patient.audio_data]); // Depend on score and audio_data
+
   return (
     <div
       className={`patient-card ${status}`}

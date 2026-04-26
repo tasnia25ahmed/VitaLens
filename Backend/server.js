@@ -28,6 +28,27 @@ async function startSystem() {
     // Runs every 10 seconds to update all 12 beds
     setInterval(async () => {
       console.log('--- Processing Ward Cycle ---');
+
+      // Inside your setInterval loop
+for (const p of scores) {
+  if (p.CONCERN_SCORE > 60) {
+    // 1. Generate the narrative
+    const whisper = await generatePatientNarrative({ ...p, urgency: 'CRITICAL' });
+
+    // 2. ONLY generate audio if it's a high-priority alert
+    // This saves your ElevenLabs credits and prevents "alarm fatigue"
+    const audioBase64 = await textToSpeech(`Attention: Bed ${p.BED_NUMBER}, ${whisper}`);
+
+    // 3. Save everything to Snowflake
+    await writeConcernLog({
+      patientId: p.PATIENT_ID,
+      score: p.CONCERN_SCORE,
+      narrative: whisper,
+      audio_url: audioBase64, // You'll need to add this column to your table!
+      trajectory: { hr: p.AVG_HR, spo2: p.AVG_SPO2 }
+    });
+  }
+}
       
       // 1. Generate new Kaggle-based vitals
       await runVitalsSimulator(); 
