@@ -3,52 +3,59 @@ import 'dotenv/config';
 
 /**
  * Generates a calm, clinical AI observation using Snowflake Cortex (Llama 3).
- * This replaces the previous Vultr/Gemma implementation.
- * * @param {Object} patient - Patient metadata (Name, Bed, Baselines)
- * @param {Array} vitalsHistory - Recent time-series vitals from Snowflake
- * @param {number} deviationScore - The calculated clinical concern score
+ * @param {Object} patient - Patient metadata
+ * @param {Array} vitalsHistory - Recent time-series vitals
+ * @param {number} deviationScore - The calculated concern score
  * @param {Object} trajectory - Predicted future vitals
  */
 export async function generatePatientNarrative({ patient, vitalsHistory, deviationScore, trajectory }) {
   
-  // Format the history into a readable string for the LLM
-  const vitalsText = vitalsHistory.slice(0, 8).map(v =>
-    `${v.TIME}: HR ${v.HEART_RATE}, SpO2 ${v.SPO2}%, RR ${v.RESP_RATE}, BP ${v.BP_SYSTOLIC}`
-  ).join('\\n');
+  // 1. Format history safely. 
+  // Note: We use || to handle both uppercase and lowercase keys from Snowflake
+  const vitalsText = vitalsHistory && vitalsHistory.length > 0 
+    ? vitalsHistory.slice(-5).map(v =>
+        `HR ${v.HEART_RATE || v.heart_rate}, SpO2 ${v.SPO2 || v.spo2}%`
+      ).join(' -> ')
+    : 'No recent history available.';
 
   const trajectoryText = trajectory
     ? `Projected state: HR ${trajectory.hr?.toFixed(0)}, SpO2 ${trajectory.spo2?.toFixed(1)}%`
     : 'Trajectory data unavailable.';
 
-  // Your original prompt logic, refined for the Cortex engine
-  const prompt = `You are GhostRound, an AI clinical observer. 
-    Whisper a brief, calm, specific observation to the night nurse.
+  // 2. Refined Prompt for Llama 3
+  const prompt = `You are an AI clinical observer. 
+    Write a brief, calm observation for a nurse's dashboard.
 
-    PATIENT: ${patient.NAME}, Bed ${patient.BED_NUMBER}
+    PATIENT: ${patient.NAME || patient.name}, Bed ${patient.BED_NUMBER || patient.bed_number}
     CONCERN SCORE: ${deviationScore.toFixed(0)} / 100
     ${trajectoryText}
 
-    RECENT VITALS:
-    ${vitalsText}
+    RECENT TREND: ${vitalsText}
 
-    BASELINES: HR ${patient.HR_BASELINE}, SpO2 ${patient.SPO2_BASELINE}%, RR ${patient.RR_BASELINE}
+    BASELINES: HR ${patient.HR_BASELINE || patient.hr_baseline}, SpO2 ${patient.SPO2_BASELINE || patient.spo2_baseline}%
 
     INSTRUCTIONS:
-    - Write 2-4 sentences.
-    - Mention actual numbers and trends.
-    - Suggest one action if score > 40.
-    - Do NOT start with "I" or the patient's name.
-    - Maximum 80 words. Only output the paragraph.`;
+    - Write 1-2 concise sentences.
+    - Mention the actual numbers and the trend.
+    - If score > 60, use an urgent but professional tone.
+    - Do NOT start with "The patient" or "I".
+    - Maximum 50 words. Output ONLY the clinical paragraph.`;
 
-  // Use Snowflake Cortex for inference
+  // 3. Execute Cortex AI Inference
+  // We use the 'NARRATIVE' alias to catch the result
   const sql = `SELECT SNOWFLAKE.CORTEX.COMPLETE('llama3-8b', ?) AS NARRATIVE`;
 
   try {
     const result = await query(sql, [prompt]);
-    // Snowflake returns results in an array; we grab the NARRATIVE column from the first row
-    return result[0].NARRATIVE.trim();
+    
+    // Check if we got a valid response
+    if (result && result.length > 0 && result[0].NARRATIVE) {
+      return result[0].NARRATIVE.trim();
+    }
+    
+    return "Analyzing vitals trend... waiting for more data points.";
   } catch (error) {
-    console.error('[Narrative Engine] Failed to generate AI whisper:', error);
-    return "Clinical observation currently unavailable due to system sync.";
+    console.error('[Narrative Engine] Cortex AI Error:', error.message);
+    return "Clinical observation unavailable. Please check live monitor.";
   }
 }

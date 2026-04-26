@@ -10,8 +10,7 @@ function initState(p) {
     bp:   p.BP_BASELINE,
     driftFactor: 0,
     driftDirection: { hr: 0, spo2: 0, rr: 0, bp: 0 },
-    cyclesRemaining: 0,
-    demoRole: null // Added to track if they have a special role
+    cyclesRemaining: 0
   };
 }
 
@@ -27,70 +26,51 @@ export async function runVitalsSimulator() {
       patientStates[p.PATIENT_ID] = initState(p);
     }
 
-    const state = patientStates[p.PATIENT_ID];
+    const state = patientStates[p.PATIENT_ID]; // 'state' is defined here...
 
-    // --- NEW DEMO OVERRIDE LOGIC ---
-    // Forces Bed 4 to be CRITICAL and Bed 3 to be WATCH
+    // --- DEMO OVERRIDE (Forcing "Scary" Data for Cortex AI) ---
     if (p.BED_NUMBER === 4) {
-        state.cyclesRemaining = 999; // Never recovers during demo
-        state.driftFactor = 0.45;    // Large 45% drift
-        state.driftDirection = { hr: 1, spo2: -1, rr: 1, bp: 0.5 }; // Crashing
+        state.cyclesRemaining = 999;
+        state.driftFactor = 0.50; 
+        state.driftDirection = { hr: 1.2, spo2: -1.5, rr: 1.2, bp: -0.8 }; 
     } 
     else if (p.BED_NUMBER === 3) {
         state.cyclesRemaining = 999; 
-        state.driftFactor = 0.20;    // Moderate 20% drift
-        state.driftDirection = { hr: 1, spo2: -1, rr: 0.5, bp: 0 }; // Drifting
-    }
-    // --- END DEMO OVERRIDE ---
-
-    // Normal Deterioration Logic for all other beds
-    else if (state.cyclesRemaining === 0 && Math.random() < 0.05) {
-      state.cyclesRemaining = Math.floor(Math.random() * 20) + 10;
-      state.driftFactor = Math.random() * 0.3 + 0.1;
-      state.driftDirection = {
-        hr: Math.random() > 0.3 ? 1 : -1,
-        spo2: Math.random() > 0.7 ? 1 : -1,
-        rr: Math.random() > 0.4 ? 1 : -1,
-        bp: Math.random() > 0.5 ? 1 : -1
-      };
-    } else if (state.cyclesRemaining > 0 && p.BED_NUMBER !== 4 && p.BED_NUMBER !== 3 && Math.random() < 0.10) {
-      state.cyclesRemaining = 0;
-      state.driftFactor = 0;
+        state.driftFactor = 0.25; 
+        state.driftDirection = { hr: 0.8, spo2: -0.6, rr: 0.5, bp: 0.2 }; 
     }
 
-    // Apply drift if in deterioration event
     if (state.cyclesRemaining > 0) {
       if (p.BED_NUMBER !== 4 && p.BED_NUMBER !== 3) state.cyclesRemaining--;
       
-      const hrDrift = p.HR_BASELINE * state.driftFactor * state.driftDirection.hr;
-      const spo2Drift = p.SPO2_BASELINE * state.driftFactor * state.driftDirection.spo2;
-      const rrDrift = p.RR_BASELINE * state.driftFactor * state.driftDirection.rr;
-      const bpDrift = p.BP_BASELINE * state.driftFactor * state.driftDirection.bp;
-
-      state.hr = jitter(state.hr * 0.7 + (p.HR_BASELINE + hrDrift) * 0.3, 4);
-      state.spo2 = jitter(state.spo2 * 0.7 + (p.SPO2_BASELINE + spo2Drift) * 0.3, 1.5);
-      state.rr = jitter(state.rr * 0.7 + (p.RR_BASELINE + rrDrift) * 0.3, 2);
-      state.bp = jitter(state.bp * 0.7 + (p.BP_BASELINE + bpDrift) * 0.3, 5);
+      const hrTarget = p.HR_BASELINE + (p.HR_BASELINE * state.driftFactor * state.driftDirection.hr);
+      const spo2Target = p.SPO2_BASELINE + (p.SPO2_BASELINE * state.driftFactor * state.driftDirection.spo2);
+      
+      state.hr = jitter(state.hr * 0.4 + hrTarget * 0.6, 5);
+      state.spo2 = jitter(state.spo2 * 0.4 + spo2Target * 0.6, 2);
     } else {
-      state.hr = jitter(state.hr * 0.85 + p.HR_BASELINE * 0.15, 2);
-      state.spo2 = jitter(state.spo2 * 0.9 + p.SPO2_BASELINE * 0.1, 0.5);
-      state.rr = jitter(state.rr * 0.85 + p.RR_BASELINE * 0.15, 1);
-      state.bp = jitter(state.bp * 0.85 + p.BP_BASELINE * 0.15, 3);
+      state.hr = jitter(p.HR_BASELINE, 3);
+      state.spo2 = jitter(p.SPO2_BASELINE, 1);
     }
 
-    // Clamp to realistic bounds
+    // Force Bed 4 to be Critical so you can test audio and Cortex AI
+    if (p.BED_NUMBER === 4) {
+        state.spo2 = Math.min(87.5, state.spo2);
+        state.hr = Math.max(115, state.hr);
+    }
+
     state.hr = Math.max(40, Math.min(160, state.hr));
     state.spo2 = Math.max(70, Math.min(100, state.spo2));
-    state.rr = Math.max(8, Math.min(40, state.rr));
-    state.bp = Math.max(80, Math.min(200, state.bp));
 
     return query(
       `INSERT INTO VITALS_STREAM (patient_id, heart_rate, spo2, resp_rate, bp_systolic)
        VALUES (?, ?, ?, ?, ?)`,
       [p.PATIENT_ID, state.hr, state.spo2, state.rr, state.bp]
     );
-  });
+  }); // ...but 'state' dies here when the map ends.
 
   await Promise.all(inserts);
-  console.log(`[Simulator] Live: Bed 4 CRITICAL, Bed 3 WATCH, others STABLE.`);
+  
+  // FIXED: No longer referencing 'state' outside the loop
+  console.log(`[Simulator] Vitals updated for ${patients.length} patients.`);
 }

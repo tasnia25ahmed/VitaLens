@@ -1,9 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { 
-  connectSnowflake, 
-  bootstrapSchema, 
-  seedPatients, 
+  initDatabase, 
   getPatientDeviationScores,
   getPatientVitalsHistory,
   writeConcernLog,
@@ -11,101 +9,90 @@ import {
 } from './snowflake.js';
 import { runVitalsSimulator } from './simulator.js';
 import { generatePatientNarrative } from './narrative.js';
+import { textToSpeech } from './elevenlabs.js';
 
-const app = express();
+const app = express(); // <--- This MUST be defined here
 app.use(cors());
 app.use(express.json());
 
-// --- INITIALIZATION ---
+// Using real ElevenLabs TTS from elevenlabs.js
+
+// --- INITIALIZATION & HEARTBEAT ---
 async function startSystem() {
   try {
-    await connectSnowflake();
-    await bootstrapSchema();
-    await seedPatients();
+    await initDatabase();
     console.log('🚀 VitaLens Backend is LIVE on Snowflake/GCP');
 
-    // --- THE HEARTBEAT LOOP ---
-    // Runs every 10 seconds to update all 12 beds
     setInterval(async () => {
-      console.log('--- Processing Ward Cycle ---');
+      try {
+        console.log('--- Processing Ward Cycle ---');
+        await runVitalsSimulator(); 
+        const scores = await getPatientDeviationScores();
 
-      // Inside your setInterval loop
-for (const p of scores) {
-  if (p.CONCERN_SCORE > 60) {
-    // 1. Generate the narrative
-    const whisper = await generatePatientNarrative({ ...p, urgency: 'CRITICAL' });
+        for (const p of scores) {
+          const currentScore = p.CONCERN_SCORE ?? p.concern_score ?? 0;
 
-    // 2. ONLY generate audio if it's a high-priority alert
-    // This saves your ElevenLabs credits and prevents "alarm fatigue"
-    const audioBase64 = await textToSpeech(`Attention: Bed ${p.BED_NUMBER}, ${whisper}`);
+          if (currentScore >= 0) {
+            const history = await getPatientVitalsHistory(p.PATIENT_ID || p.patient_id);
+            const whisper = await generatePatientNarrative({
+              patient: p,
+              vitalsHistory: history,
+              deviationScore: currentScore,
+              urgency: currentScore > 60 ? 'CRITICAL' : 'STABLE'
+            });
 
-    // 3. Save everything to Snowflake
-    await writeConcernLog({
-      patientId: p.PATIENT_ID,
-      score: p.CONCERN_SCORE,
-      narrative: whisper,
-      audio_url: audioBase64, // You'll need to add this column to your table!
-      trajectory: { hr: p.AVG_HR, spo2: p.AVG_SPO2 }
-    });
-  }
-}
-      
-      // 1. Generate new Kaggle-based vitals
-      await runVitalsSimulator(); 
+            let audioBase64 = null;
+            if (currentScore > 60) {
+              audioBase64 = await textToSpeech(`Attention: Bed ${p.BED_NUMBER || p.bed_number}, ${whisper}`);
+            }
 
-      // 2. Calculate clinical concern scores
-      const scores = await getPatientDeviationScores();
-
-      // 3. Narrative Generation (The AI Whispers)
-      for (const p of scores) {
-        // Only trigger AI for patients who are actually drifting (Score > 40)
-        if (p.CONCERN_SCORE > 40) {
-          const history = await getPatientVitalsHistory(p.PATIENT_ID);
-          const whisper = await generatePatientNarrative({
-            patient: p,
-            vitalsHistory: history,
-            deviationScore: p.CONCERN_SCORE
-          });
-
-          await writeConcernLog({
-            patientId: p.PATIENT_ID,
-            score: p.CONCERN_SCORE,
-            narrative: whisper,
-            trajectory: { hr: p.AVG_HR + p.HR_TREND, spo2: p.AVG_SPO2 + p.SPO2_TREND }
-          });
+            await writeConcernLog({
+              patientId: p.PATIENT_ID || p.patient_id,
+              score: currentScore,
+              narrative: whisper,
+              audioData: audioBase64,
+              trajectory: { 
+                hr: (p.AVG_HR || 0) + (p.HR_TREND || 0), 
+                spo2: (p.AVG_SPO2 || 0) + (p.SPO2_TREND || 0) 
+              }
+            });
+          }
         }
+      } catch (loopErr) {
+        console.error('Error in Heartbeat Loop:', loopErr);
       }
     }, 10000); 
 
   } catch (err) {
     console.error('Failed to start system:', err);
+    process.exit(1);
   }
 }
 
-// --- API ENDPOINTS FOR REACT ---
+// --- API ENDPOINTS ---
+// Placing these clearly outside of startSystem()
 app.get('/api/dashboard', async (req, res) => {
   try {
-    // 1. Get LIVE deviation scores from real vitals
     const liveScores = await getPatientDeviationScores();
-    
-    // 2. Get latest AI narratives from concern logs
     const concernLogs = await getLatestConcernLogs();
     
-    // 3. Merge: live scores drive the status, narratives add the story
     const merged = liveScores.map(p => {
-      const log = concernLogs.find(l => l.PATIENT_ID === p.PATIENT_ID);
+      const pid = p.PATIENT_ID || p.patient_id;
+      const log = concernLogs.find(l => (l.PATIENT_ID || l.patient_id) === pid);
+      
       return {
-        PATIENT_ID: p.PATIENT_ID,
-        NAME: p.NAME,
-        BED_NUMBER: p.BED_NUMBER,
-        CONCERN_SCORE: p.CONCERN_SCORE,           // LIVE score from vitals
-        AVG_HR: p.AVG_HR,
-        AVG_SPO2: p.AVG_SPO2,
-        AVG_RR: p.AVG_RR,
-        AVG_BP: p.AVG_BP,
-        HR_TREND: p.HR_TREND,
-        SPO2_TREND: p.SPO2_TREND,
-        NARRATIVE_TEXT: log?.NARRATIVE_TEXT || 'Analyzing real-time vitals...'
+        PATIENT_ID: pid,
+        NAME: p.NAME || p.name,
+        BED_NUMBER: p.BED_NUMBER || p.bed_number,
+        CONCERN_SCORE: p.CONCERN_SCORE ?? p.concern_score ?? 0,
+        AVG_HR: p.AVG_HR || 0,
+        AVG_SPO2: p.AVG_SPO2 || 0,
+        AVG_RR: p.AVG_RR || 0,
+        AVG_BP: p.AVG_BP || 0,
+        HR_TREND: p.HR_TREND || 0,
+        SPO2_TREND: p.SPO2_TREND || 0,
+        NARRATIVE_TEXT: log?.NARRATIVE_TEXT || log?.narrative_text || 'Analyzing real-time vitals...',
+        AUDIO_DATA: log?.AUDIO_DATA || log?.audio_data || null
       };
     });
     
@@ -116,4 +103,8 @@ app.get('/api/dashboard', async (req, res) => {
   }
 });
 
-app.listen(3001, () => startSystem());
+// --- START SERVER ---
+app.listen(3001, () => {
+  console.log('Server listening on port 3001');
+  startSystem();
+});

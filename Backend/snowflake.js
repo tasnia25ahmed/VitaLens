@@ -10,17 +10,14 @@ let connection = null;
 
 /**
  * Singleton pattern to manage the Snowflake connection.
- * Ensures we don't open a new connection every time a query is run.
  */
 export function getConnection() {
   if (connection) return connection;
   
-  // Support both SNOWFLAKE_USERNAME and SNOWFLAKE_USER for compatibility
   const username = process.env.SNOWFLAKE_USERNAME || process.env.SNOWFLAKE_USER;
   
   if (!username) {
-    console.error('ERROR: Neither SNOWFLAKE_USERNAME nor SNOWFLAKE_USER is set in environment.');
-    console.error('Available env vars:', Object.keys(process.env).filter(k => k.includes('SNOWFLAKE')));
+    console.error('ERROR: Snowflake credentials missing in .env file.');
   }
   
   connection = snowflake.createConnection({
@@ -35,22 +32,25 @@ export function getConnection() {
 }
 
 /**
- * Initializes the handshake with Snowflake.
+ * Promisified connection handshake.
  */
 export function connectSnowflake() {
   return new Promise((resolve, reject) => {
     const conn = getConnection();
     conn.connect((err, conn) => {
-      if (err) reject(err);
-      else resolve(conn);
+      if (err) {
+        console.error('[Snowflake] Connection Failed:', err.message);
+        reject(err);
+      } else {
+        console.log('[Snowflake] Connected as ID:', conn.getId());
+        resolve(conn);
+      }
     });
   });
 }
 
 /**
  * General-purpose query runner.
- * @param {string} sql - The SQL query to execute.
- * @param {Array} binds - The parameters to safely inject into the SQL.
  */
 export function query(sql, binds = []) {
   return new Promise((resolve, reject) => {
@@ -65,13 +65,11 @@ export function query(sql, binds = []) {
   });
 }
 
-// ── DATA GOVERNANCE: Schema Setup ─────────────────────────────────────────────
 /**
- * Creates the necessary database tables if they do not already exist.
- * This ensures the application is "self-healing" on a new Snowflake account.
+ * Sets up the Tables. Note: Added AUDIO_DATA to CONCERN_LOG.
  */
 export async function bootstrapSchema() {
-  // Table 1: Static patient data and their clinical baselines
+  // 1. Patients Table
   await query(`
     CREATE TABLE IF NOT EXISTS PATIENTS (
       patient_id    VARCHAR PRIMARY KEY,
@@ -85,7 +83,7 @@ export async function bootstrapSchema() {
     )
   `);
 
-  // Table 2: Time-series vitals (the 'firehose' of data)
+  // 2. Vitals Stream Table
   await query(`
     CREATE TABLE IF NOT EXISTS VITALS_STREAM (
       reading_id   VARCHAR DEFAULT UUID_STRING() PRIMARY KEY,
@@ -98,7 +96,7 @@ export async function bootstrapSchema() {
     )
   `);
 
-  // Table 3: Audit log for AI-generated clinical insights
+  // 3. Concern Log Table
   await query(`
     CREATE TABLE IF NOT EXISTS CONCERN_LOG (
       log_id          VARCHAR DEFAULT UUID_STRING() PRIMARY KEY,
@@ -106,30 +104,26 @@ export async function bootstrapSchema() {
       generated_at    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
       concern_score   FLOAT,
       narrative_text  VARCHAR,
-      audio_url       VARCHAR,
+      audio_data      TEXT, 
       trajectory_json VARIANT
     )
   `);
 
-  console.log('[Snowflake] Database architecture validated.');
+  console.log('[Snowflake] Architecture validated.');
 }
 
-// ── KAGGLE INTEGRATION: Data Seeding ─────────────────────────────────────────
 /**
- * Populates the ward with 12 patients using baseline data derived from Kaggle.
- * This serves as the 'Anchor' for the real-time simulator.
+ * Seeds the 12-bed ward.
  */
 export async function seedPatients() {
   const existing = await query(`SELECT COUNT(*) AS cnt FROM PATIENTS`);
   if (existing[0].CNT >= 12) return; 
 
-  await query(`DELETE FROM PATIENTS`);
-
   const patients = [
     ['pt-001', 'Margaret Chen',   1, 74, 97, 15, 118],
     ['pt-002', 'Raj Patel',       2, 68, 98, 13, 125],
     ['pt-003', 'Amara Osei',      3, 80, 96, 16, 130],
-    ['pt-004', 'Luca Moretti',    4, 99, 95, 16, 118], // High HR demo case
+    ['pt-004', 'Luca Moretti',    4, 99, 95, 16, 118],
     ['pt-005', 'Sofia Andersen',  5, 65, 97, 12, 122],
     ['pt-006', 'James Okwu',      6, 78, 98, 15, 128],
     ['pt-007', 'Yuki Tanaka',     7, 70, 99, 13, 116],
@@ -147,17 +141,23 @@ export async function seedPatients() {
       [id, name, bed, hr, spo2, rr, bp]
     );
   }
-  console.log('[Snowflake] 12-Bed ward seeded successfully.');
+  console.log('[Snowflake] Ward seeded.');
 }
 
-// ── CLINICAL INTELLIGENCE: Scoring Algorithm ──────────────────────────────────
-/**
- * Calculates the 'Concern Score' for each patient.
- * The score is based on the % deviation from THEIR specific baseline.
- * SpO2 carries the most weight (40%) as it is the most critical survival metric.
- */
+// --- CLINICAL QUERIES ---
+
+export async function getPatientVitalsHistory(patientId) {
+  return await query(`
+    SELECT recorded_at, heart_rate, spo2, resp_rate, bp_systolic
+    FROM VITALS_STREAM
+    WHERE patient_id = ?
+    AND recorded_at > DATEADD(minute, -30, CURRENT_TIMESTAMP())
+    ORDER BY recorded_at ASC
+  `, [patientId]);
+}
+
 export async function getPatientDeviationScores() {
-  return query(`
+  return await query(`
     WITH recent AS (
       SELECT
         v.patient_id, p.name, p.bed_number,
@@ -166,15 +166,10 @@ export async function getPatientDeviationScores() {
         AVG(v.spo2)        AS avg_spo2,
         AVG(v.resp_rate)   AS avg_rr,
         AVG(v.bp_systolic) AS avg_bp,
-        -- Trend calculation: Is the patient getting better or worse?
         AVG(CASE WHEN v.recorded_at > DATEADD(minute, -5, CURRENT_TIMESTAMP()) THEN v.heart_rate END)
-          - AVG(CASE WHEN v.recorded_at BETWEEN DATEADD(minute, -10, CURRENT_TIMESTAMP()) 
-                                            AND DATEADD(minute, -5, CURRENT_TIMESTAMP()) 
-                THEN v.heart_rate END) AS hr_trend,
+          - AVG(CASE WHEN v.recorded_at BETWEEN DATEADD(minute, -10, CURRENT_TIMESTAMP()) AND DATEADD(minute, -5, CURRENT_TIMESTAMP()) THEN v.heart_rate END) AS hr_trend,
         AVG(CASE WHEN v.recorded_at > DATEADD(minute, -5, CURRENT_TIMESTAMP()) THEN v.spo2 END)
-          - AVG(CASE WHEN v.recorded_at BETWEEN DATEADD(minute, -10, CURRENT_TIMESTAMP()) 
-                                            AND DATEADD(minute, -5, CURRENT_TIMESTAMP()) 
-                THEN v.spo2 END) AS spo2_trend
+          - AVG(CASE WHEN v.recorded_at BETWEEN DATEADD(minute, -10, CURRENT_TIMESTAMP()) AND DATEADD(minute, -5, CURRENT_TIMESTAMP()) THEN v.spo2 END) AS spo2_trend
       FROM VITALS_STREAM v
       JOIN PATIENTS p ON v.patient_id = p.patient_id
       WHERE v.recorded_at > DATEADD(minute, -30, CURRENT_TIMESTAMP())
@@ -184,99 +179,69 @@ export async function getPatientDeviationScores() {
       patient_id, name, bed_number,
       avg_hr, avg_spo2, avg_rr, avg_bp,
       hr_trend, spo2_trend,
-      -- Math: (Current - Baseline) / Baseline * Weights
       ROUND(LEAST(100, GREATEST(0,
-        (ABS(avg_hr   - hr_baseline)   / NULLIF(hr_baseline,0))   * 100 * 0.25
+        (ABS(avg_hr - hr_baseline) / NULLIF(hr_baseline,0)) * 100 * 0.25
       + (ABS(avg_spo2 - spo2_baseline) / NULLIF(spo2_baseline,0)) * 100 * 0.40
-      + (ABS(avg_rr   - rr_baseline)   / NULLIF(rr_baseline,0))   * 100 * 0.20
-      + (ABS(avg_bp   - bp_baseline)   / NULLIF(bp_baseline,0))   * 100 * 0.15
-      -- Penalties for rapid deterioration
+      + (ABS(avg_rr - rr_baseline) / NULLIF(rr_baseline,0)) * 100 * 0.20
+      + (ABS(avg_bp - bp_baseline) / NULLIF(bp_baseline,0)) * 100 * 0.15
       + CASE WHEN spo2_trend < -1 THEN 25 ELSE 0 END
-      + CASE WHEN hr_trend   > 5  THEN 15 ELSE 0 END
+      + CASE WHEN hr_trend > 5 THEN 15 ELSE 0 END
+      -- Absolute clinical thresholds for demo-critical vitals
+      + CASE WHEN avg_spo2 < 86 THEN 50 WHEN avg_spo2 < 90 THEN 35 WHEN avg_spo2 < 92 THEN 15 ELSE 0 END
+      + CASE WHEN avg_hr > 115 THEN 30 WHEN avg_hr > 110 THEN 15 WHEN avg_hr < 50 THEN 30 ELSE 0 END
+      + CASE WHEN avg_rr > 28 THEN 20 WHEN avg_rr > 22 THEN 10 ELSE 0 END
+      + CASE WHEN avg_bp > 160 OR avg_bp < 90 THEN 15 ELSE 0 END
       ))) AS concern_score
     FROM recent
     ORDER BY concern_score DESC
   `);
-  }
+}
 
-/**
- * Returns ALL 12 patients with their latest concern scores and narratives.
- * Falls back to stable defaults if no logs exist yet.
- */
 export async function getLatestConcernLogs() {
-  const sql = `
-    SELECT 
-      p.PATIENT_ID, 
-      p.NAME, 
-      p.BED_NUMBER, 
-      COALESCE(cl.CONCERN_SCORE, 0) AS CONCERN_SCORE, 
-      COALESCE(cl.NARRATIVE_TEXT, 'No active concerns. Patient vitals within normal range.') AS NARRATIVE_TEXT,
-      p.HR_BASELINE AS AVG_HR,
-      p.SPO2_BASELINE AS AVG_SPO2,
-      p.RR_BASELINE AS AVG_RR,
-      p.BP_BASELINE AS AVG_BP
+  return await query(`
+    SELECT p.PATIENT_ID, p.NAME, p.BED_NUMBER, 
+    COALESCE(cl.CONCERN_SCORE, 0) AS CONCERN_SCORE, 
+    COALESCE(cl.NARRATIVE_TEXT, 'No active concerns.') AS NARRATIVE_TEXT,
+    cl.AUDIO_DATA,
+    p.HR_BASELINE AS AVG_HR, p.SPO2_BASELINE AS AVG_SPO2, p.RR_BASELINE AS AVG_RR, p.BP_BASELINE AS AVG_BP
     FROM PATIENTS p
     LEFT JOIN (
-      SELECT PATIENT_ID, CONCERN_SCORE, NARRATIVE_TEXT
+      SELECT PATIENT_ID, CONCERN_SCORE, NARRATIVE_TEXT, AUDIO_DATA,
+             ROW_NUMBER() OVER (PARTITION BY PATIENT_ID ORDER BY GENERATED_AT DESC) as rank
       FROM CONCERN_LOG
-      WHERE GENERATED_AT = (
-        SELECT MAX(GENERATED_AT)
-        FROM CONCERN_LOG AS sub
-        WHERE sub.PATIENT_ID = CONCERN_LOG.PATIENT_ID
-      )
-    ) cl ON p.PATIENT_ID = cl.PATIENT_ID
-    ORDER BY CONCERN_SCORE DESC;
+    ) cl ON p.PATIENT_ID = cl.PATIENT_ID AND cl.rank = 1
+    ORDER BY CONCERN_SCORE DESC
+  `);
+}
+
+export async function writeConcernLog({ patientId, score, narrative, trajectory, audioData }) {
+  // Use SELECT instead of VALUES to bypass the PARSE_JSON limitation with bind variables
+  const sql = `
+    INSERT INTO CONCERN_LOG (PATIENT_ID, GENERATED_AT, CONCERN_SCORE, NARRATIVE_TEXT, TRAJECTORY_JSON, AUDIO_DATA) 
+    SELECT ?, CURRENT_TIMESTAMP(), ?, ?, PARSE_JSON(?), ?
   `;
   
-  return await query(sql); 
+  const trajectoryJson = trajectory ? JSON.stringify(trajectory) : JSON.stringify({});
+  
+  try {
+    return await query(sql, [patientId, score, narrative, trajectoryJson, audioData || null]);
+  } catch (err) {
+    console.error('[Snowflake] writeConcernLog Error:', err.message);
+    throw err;
+  }
 }
 
 /**
- * Fetches the last 30 minutes of vital signs for a specific patient.
- * Used to populate the trend charts in the PatientDetail view.
+ * One-call initialization to be used in server.js startup.
  */
-export async function getPatientVitalsHistory(patientId) {
-  const sql = `
-    SELECT 
-      recorded_at,
-      heart_rate,
-      spo2,
-      resp_rate,
-      bp_systolic
-    FROM VITALS_STREAM
-    WHERE patient_id = ?
-    AND recorded_at > DATEADD(minute, -30, CURRENT_TIMESTAMP())
-    ORDER BY recorded_at ASC;
-  `;
-  
-  return await query(sql, [patientId]);
-}
-
-// Update Table 3 in bootstrapSchema()
-await query(`
-  CREATE TABLE IF NOT EXISTS CONCERN_LOG (
-    log_id          VARCHAR DEFAULT UUID_STRING() PRIMARY KEY,
-    patient_id      VARCHAR REFERENCES PATIENTS(patient_id),
-    generated_at    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-    concern_score   FLOAT,
-    narrative_text  VARCHAR,
-    audio_data      TEXT, -- Add this to store the Base64 string
-    trajectory_json VARIANT
-  )
-`);
-/**
- * Writes the AI-generated clinical narrative and concern score to the audit log.
- */
-export async function writeConcernLog({ patientId, score, narrative, trajectory }) {
-  const sql = `
- INSERT INTO CONCERN_LOG (
-      PATIENT_ID, 
-      GENERATED_AT, 
-      CONCERN_SCORE, 
-      NARRATIVE_TEXT,
-      TRAJECTORY_JSON
-    ) VALUES (?, CURRENT_TIMESTAMP(), ?, ?, PARSE_JSON(?))
-  `;
-  const trajectoryJson = trajectory ? JSON.stringify(trajectory) : null;
-  return await query(sql, [patientId, score, narrative, trajectoryJson]);
+export async function initDatabase() {
+  try {
+    await connectSnowflake();
+    await bootstrapSchema();
+    await seedPatients();
+    console.log('[Snowflake] Full system ready.');
+  } catch (err) {
+    console.error('[Snowflake] Init Error:', err);
+    throw err;
+  }
 }
